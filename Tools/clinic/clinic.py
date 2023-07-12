@@ -13,6 +13,7 @@ import collections
 import contextlib
 import copy
 import cpp
+import dataclasses as dc
 import enum
 import functools
 import hashlib
@@ -758,7 +759,7 @@ class CLanguage(Language):
     def render(
             self,
             clinic: Clinic | None,
-            signatures: Iterable[Function]
+            signatures: Iterable[Module | Class | Function]
     ) -> str:
         function = None
         for o in signatures:
@@ -1617,19 +1618,6 @@ class CLanguage(Language):
         return clinic.get_destination('block').dump()
 
 
-
-
-@contextlib.contextmanager
-def OverrideStdioWith(stdout):
-    saved_stdout = sys.stdout
-    sys.stdout = stdout
-    try:
-        yield
-    finally:
-        assert sys.stdout is stdout
-        sys.stdout = saved_stdout
-
-
 def create_regex(
         before: str,
         after: str,
@@ -1645,6 +1633,7 @@ def create_regex(
     return re.compile(pattern)
 
 
+@dc.dataclass(slots=True, repr=False)
 class Block:
     r"""
     Represents a single block of text embedded in
@@ -1691,18 +1680,16 @@ class Block:
     "preindent" would be "____" and "indent" would be "__".
 
     """
-    def __init__(self, input, dsl_name=None, signatures=None, output=None, indent='', preindent=''):
-        assert isinstance(input, str)
-        self.input = input
-        self.dsl_name = dsl_name
-        self.signatures = signatures or []
-        self.output = output
-        self.indent = indent
-        self.preindent = preindent
+    input: str
+    dsl_name: str | None = None
+    signatures: list[Module | Class | Function] = dc.field(default_factory=list)
+    output: Any = None  # TODO: Very dynamic; probably untypeable in its current form?
+    indent: str = ''
+    preindent: str = ''
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         dsl_name = self.dsl_name or "text"
-        def summarize(s):
+        def summarize(s: object) -> str:
             s = repr(s)
             if len(s) > 30:
                 return s[:26] + "..." + s[0]
@@ -1871,11 +1858,10 @@ class BlockParser:
         return Block(input_output(), dsl_name, output=output)
 
 
+@dc.dataclass(slots=True)
 class BlockPrinter:
-
-    def __init__(self, language, f=None):
-        self.language = language
-        self.f = f or io.StringIO()
+    language: Language
+    f: io.StringIO = dc.field(default_factory=io.StringIO)
 
     def print_block(self, block, *, core_includes=False):
         input = block.input
@@ -1973,14 +1959,19 @@ class Destination:
         self.name = name
         self.type = type
         self.clinic = clinic
+        self.buffers = BufferSeries()
+
         valid_types = ('buffer', 'file', 'suppress')
         if type not in valid_types:
-            fail("Invalid destination type " + repr(type) + " for " + name + " , must be " + ', '.join(valid_types))
+            fail(
+                f"Invalid destination type {type!r} for {name}, "
+                f"must be {', '.join(valid_types)}"
+            )
         extra_arguments = 1 if type == "file" else 0
         if len(args) < extra_arguments:
-            fail("Not enough arguments for destination " + name + " new " + type)
+            fail(f"Not enough arguments for destination {name} new {type}")
         if len(args) > extra_arguments:
-            fail("Too many arguments for destination " + name + " new " + type)
+            fail(f"Too many arguments for destination {name} new {type}")
         if type =='file':
             d = {}
             filename = clinic.filename
@@ -1992,8 +1983,6 @@ class Destination:
             d['basename'] = basename
             d['basename_root'], d['basename_extension'] = os.path.splitext(filename)
             self.filename = args[0].format_map(d)
-
-        self.buffers = BufferSeries()
 
     def __repr__(self):
         if self.type == 'file':
@@ -2021,22 +2010,20 @@ extensions: LangDict = { name: CLanguage for name in "c cc cpp cxx h hh hpp hxx"
 extensions['py'] = PythonLanguage
 
 
-def file_changed(filename: str, new_contents: str) -> bool:
-    """Return true if file contents changed (meaning we must update it)"""
-    try:
-        with open(filename, encoding="utf-8") as fp:
-            old_contents = fp.read()
-        return old_contents != new_contents
-    except FileNotFoundError:
-        return True
-
-
 def write_file(filename: str, new_contents: str) -> None:
+    try:
+        with open(filename, 'r', encoding="utf-8") as fp:
+            old_contents = fp.read()
+
+        if old_contents == new_contents:
+            # no change: avoid modifying the file modification time
+            return
+    except FileNotFoundError:
+        pass
     # Atomic write using a temporary file and os.replace()
     filename_new = f"{filename}.new"
     with open(filename_new, "w", encoding="utf-8") as fp:
         fp.write(new_contents)
-
     try:
         os.replace(filename_new, filename)
     except:
@@ -2214,8 +2201,6 @@ impl_definition block
                          traceback.format_exc().rstrip())
             printer.print_block(block)
 
-        clinic_out = []
-
         # these are destinations not buffers
         for name, destination in self.destinations.items():
             if destination.type == 'suppress':
@@ -2223,7 +2208,6 @@ impl_definition block
             output = destination.dump()
 
             if output:
-
                 block = Block("", dsl_name="clinic", output=output)
 
                 if destination.type == 'buffer':
@@ -2255,11 +2239,10 @@ impl_definition block
                     block.input = 'preserve\n'
                     printer_2 = BlockPrinter(self.language)
                     printer_2.print_block(block, core_includes=True)
-                    pair = destination.filename, printer_2.f.getvalue()
-                    clinic_out.append(pair)
+                    write_file(destination.filename, printer_2.f.getvalue())
                     continue
 
-        return printer.f.getvalue(), clinic_out
+        return printer.f.getvalue()
 
 
     def _module_and_class(self, fields):
@@ -2321,14 +2304,9 @@ def parse_file(
 
     assert isinstance(language, CLanguage)
     clinic = Clinic(language, verify=verify, filename=filename)
-    src_out, clinic_out = clinic.parse(raw)
+    cooked = clinic.parse(raw)
 
-    changes = [(fn, data) for fn, data in clinic_out if file_changed(fn, data)]
-    if changes:
-        # Always (re)write the source file.
-        write_file(output, src_out)
-        for fn, data in clinic_out:
-            write_file(fn, data)
+    write_file(output, cooked)
 
 
 def compute_checksum(
@@ -2342,28 +2320,23 @@ def compute_checksum(
     return s
 
 
-
-
 class PythonParser:
     def __init__(self, clinic: Clinic) -> None:
         pass
 
     def parse(self, block: Block) -> None:
-        s = io.StringIO()
-        with OverrideStdioWith(s):
+        with contextlib.redirect_stdout(io.StringIO()) as s:
             exec(block.input)
-        block.output = s.getvalue()
+            block.output = s.getvalue()
 
 
+@dc.dataclass(repr=False)
 class Module:
-    def __init__(
-            self,
-            name: str,
-            module = None
-    ) -> None:
-        self.name = name
-        self.module = self.parent = module
+    name: str
+    module: Module | None = None
 
+    def __post_init__(self) -> None:
+        self.parent = self.module
         self.modules: ModuleDict = {}
         self.classes: ClassDict = {}
         self.functions: list[Function] = []
@@ -2372,22 +2345,16 @@ class Module:
         return "<clinic.Module " + repr(self.name) + " at " + str(id(self)) + ">"
 
 
+@dc.dataclass(repr=False)
 class Class:
-    def __init__(
-            self,
-            name: str,
-            module: Module | None = None,
-            cls = None,
-            typedef: str | None = None,
-            type_object: str | None = None
-    ) -> None:
-        self.name = name
-        self.module = module
-        self.cls = cls
-        self.typedef = typedef
-        self.type_object = type_object
-        self.parent = cls or module
+    name: str
+    module: Module | None = None
+    cls: Class | None = None
+    typedef: str | None = None
+    type_object: str | None = None
 
+    def __post_init__(self) -> None:
+        self.parent = self.cls or self.module
         self.classes: ClassDict = {}
         self.functions: list[Function] = []
 
@@ -2474,6 +2441,8 @@ INVALID, CALLABLE, STATIC_METHOD, CLASS_METHOD, METHOD_INIT, METHOD_NEW
 ParamDict = dict[str, "Parameter"]
 ReturnConverterType = Callable[..., "CReturnConverter"]
 
+
+@dc.dataclass(repr=False)
 class Function:
     """
     Mutable duck type for inspect.Function.
@@ -2485,49 +2454,34 @@ class Function:
         It will always be true that
             (not docstring) or ((not docstring[0].isspace()) and (docstring.rstrip() == docstring))
     """
+    parameters: ParamDict = dc.field(default_factory=dict)
+    _: dc.KW_ONLY
+    name: str
+    module: Module
+    cls: Class | None = None
+    c_basename: str | None = None
+    full_name: str | None = None
+    return_converter: CReturnConverter
+    return_annotation: object = inspect.Signature.empty
+    docstring: str = ''
+    kind: str = CALLABLE
+    coexist: bool = False
+    # docstring_only means "don't generate a machine-readable
+    # signature, just a normal docstring".  it's True for
+    # functions with optional groups because we can't represent
+    # those accurately with inspect.Signature in 3.4.
+    docstring_only: bool = False
 
-    def __init__(
-            self,
-            parameters: ParamDict | None = None,
-            *,
-            name: str,
-            module: Module,
-            cls: Class | None = None,
-            c_basename: str | None = None,
-            full_name: str | None = None,
-            return_converter: CReturnConverter,
-            return_annotation = inspect.Signature.empty,
-            docstring: str | None = None,
-            kind: str = CALLABLE,
-            coexist: bool = False,
-            docstring_only: bool = False
-    ) -> None:
-        self.parameters = parameters or {}
-        self.return_annotation = return_annotation
-        self.name = name
-        self.full_name = full_name
-        self.module = module
-        self.cls = cls
-        self.parent = cls or module
-        self.c_basename = c_basename
-        self.return_converter = return_converter
-        self.docstring = docstring or ''
-        self.kind = kind
-        self.coexist = coexist
+    def __post_init__(self) -> None:
+        self.parent: Class | Module = self.cls or self.module
         self.self_converter: self_converter | None = None
-        # docstring_only means "don't generate a machine-readable
-        # signature, just a normal docstring".  it's True for
-        # functions with optional groups because we can't represent
-        # those accurately with inspect.Signature in 3.4.
-        self.docstring_only = docstring_only
+        self.__render_parameters__: list[Parameter] | None = None
 
-        self.rendered_parameters = None
-
-    __render_parameters__ = None
     @property
-    def render_parameters(self):
+    def render_parameters(self) -> list[Parameter]:
         if not self.__render_parameters__:
-            self.__render_parameters__ = l = []
+            l: list[Parameter] = []
+            self.__render_parameters__ = l
             for p in self.parameters.values():
                 p = p.copy()
                 p.converter.pre_render()
@@ -2552,17 +2506,8 @@ class Function:
     def __repr__(self) -> str:
         return '<clinic.Function ' + self.name + '>'
 
-    def copy(self, **overrides) -> "Function":
-        kwargs = {
-            'name': self.name, 'module': self.module, 'parameters': self.parameters,
-            'cls': self.cls, 'c_basename': self.c_basename,
-            'full_name': self.full_name,
-            'return_converter': self.return_converter, 'return_annotation': self.return_annotation,
-            'docstring': self.docstring, 'kind': self.kind, 'coexist': self.coexist,
-            'docstring_only': self.docstring_only,
-            }
-        kwargs.update(overrides)
-        f = Function(**kwargs)
+    def copy(self, **overrides: Any) -> Function:
+        f = dc.replace(self, **overrides)
         f.parameters = {
             name: value.copy(function=f)
             for name, value in f.parameters.items()
@@ -2570,31 +2515,21 @@ class Function:
         return f
 
 
+@dc.dataclass(repr=False, slots=True)
 class Parameter:
     """
     Mutable duck type of inspect.Parameter.
     """
-
-    def __init__(
-            self,
-            name: str,
-            kind: inspect._ParameterKind,
-            *,
-            default = inspect.Parameter.empty,
-            function: Function,
-            converter: "CConverter",
-            annotation = inspect.Parameter.empty,
-            docstring: str | None = None,
-            group: int = 0
-    ) -> None:
-        self.name = name
-        self.kind = kind
-        self.default = default
-        self.function = function
-        self.converter = converter
-        self.annotation = annotation
-        self.docstring = docstring or ''
-        self.group = group
+    name: str
+    kind: inspect._ParameterKind
+    _: dc.KW_ONLY
+    default: object = inspect.Parameter.empty
+    function: Function
+    converter: CConverter
+    annotation: object = inspect.Parameter.empty
+    docstring: str = ''
+    group: int = 0
+    right_bracket_count: int = dc.field(init=False, default=0)
 
     def __repr__(self) -> str:
         return '<clinic.Parameter ' + self.name + '>'
@@ -2611,18 +2546,19 @@ class Parameter:
     def is_optional(self) -> bool:
         return not self.is_vararg() and (self.default is not unspecified)
 
-    def copy(self, **overrides) -> "Parameter":
-        kwargs = {
-            'name': self.name, 'kind': self.kind, 'default':self.default,
-                 'function': self.function, 'converter': self.converter, 'annotation': self.annotation,
-                 'docstring': self.docstring, 'group': self.group,
-            }
-        kwargs.update(overrides)
-        if 'converter' not in overrides:
+    def copy(
+        self,
+        /,
+        *,
+        converter: CConverter | None = None,
+        function: Function | None = None,
+        **overrides: Any
+    ) -> Parameter:
+        function = function or self.function
+        if not converter:
             converter = copy.copy(self.converter)
-            converter.function = kwargs['function']
-            kwargs['converter'] = converter
-        return Parameter(**kwargs)
+            converter.function = function
+        return dc.replace(self, **overrides, function=function, converter=converter)
 
     def get_displayname(self, i: int) -> str:
         if i == 0:
@@ -2633,13 +2569,10 @@ class Parameter:
             return f'"argument {i}"'
 
 
+@dc.dataclass
 class LandMine:
     # try to access any
-    def __init__(self, message: str) -> None:
-        self.__message__ = message
-
-    def __repr__(self) -> str:
-        return '<LandMine ' + repr(self.__message__) + ">"
+    __message__: str
 
     def __getattribute__(self, name: str):
         if name in ('__repr__', '__message__'):
@@ -2799,7 +2732,7 @@ class CConverter(metaclass=CConverterAutoRegister):
              # Positional args:
              name: str,
              py_name: str,
-             function,
+             function: Function,
              default: object = unspecified,
              *,  # Keyword only args:
              c_default: str | None = None,
@@ -2838,7 +2771,9 @@ class CConverter(metaclass=CConverterAutoRegister):
         # about the function in the init.
         # (that breaks if we get cloned.)
         # so after this change we will noisily fail.
-        self.function = LandMine("Don't access members of self.function inside converter_init!")
+        self.function: Function | LandMine = LandMine(
+            "Don't access members of self.function inside converter_init!"
+        )
         self.converter_init(**kwargs)
         self.function = function
 
@@ -2848,7 +2783,7 @@ class CConverter(metaclass=CConverterAutoRegister):
     def is_optional(self) -> bool:
         return (self.default is not unspecified)
 
-    def _render_self(self, parameter: str, data: CRenderData) -> None:
+    def _render_self(self, parameter: Parameter, data: CRenderData) -> None:
         self.parameter = parameter
         name = self.parser_name
 
@@ -2908,7 +2843,7 @@ class CConverter(metaclass=CConverterAutoRegister):
         if cleanup:
             data.cleanup.append('/* Cleanup for ' + name + ' */\n' + cleanup.rstrip() + "\n")
 
-    def render(self, parameter: str, data: CRenderData) -> None:
+    def render(self, parameter: Parameter, data: CRenderData) -> None:
         """
         parameter is a clinic.Parameter instance.
         data is a CRenderData instance.
@@ -4686,10 +4621,13 @@ class DSLParser:
 
                 if not (existing_function.kind == self.kind and existing_function.coexist == self.coexist):
                     fail("'kind' of function and cloned function don't match!  (@classmethod/@staticmethod/@coexist)")
-                self.function = existing_function.copy(name=function_name, full_name=full_name, module=module, cls=cls, c_basename=c_basename, docstring='')
-
-                self.block.signatures.append(self.function)
-                (cls or module).functions.append(self.function)
+                function = existing_function.copy(
+                    name=function_name, full_name=full_name, module=module,
+                    cls=cls, c_basename=c_basename, docstring=''
+                )
+                self.function = function
+                self.block.signatures.append(function)
+                (cls or module).functions.append(function)
                 self.next(self.state_function_docstring)
                 return
 
@@ -5284,7 +5222,7 @@ class DSLParser:
         assert isinstance(parameters[0].converter, self_converter)
         # self is always positional-only.
         assert parameters[0].is_positional_only()
-        parameters[0].right_bracket_count = 0
+        assert parameters[0].right_bracket_count == 0
         positional_only = True
         for p in parameters[1:]:
             if not p.is_positional_only():
