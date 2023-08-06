@@ -10,23 +10,24 @@
 #include "pycore_abstract.h"      // _PyIndex_Check()
 #include "pycore_ceval.h"         // _PyEval_SignalAsyncExc()
 #include "pycore_code.h"
+#include "pycore_emscripten_signal.h"  // _Py_CHECK_EMSCRIPTEN_SIGNALS
 #include "pycore_function.h"
+#include "pycore_instruments.h"
 #include "pycore_intrinsics.h"
 #include "pycore_long.h"          // _PyLong_GetZero()
-#include "pycore_instruments.h"
-#include "pycore_object.h"        // _PyObject_GC_TRACK()
 #include "pycore_moduleobject.h"  // PyModuleObject
+#include "pycore_object.h"        // _PyObject_GC_TRACK()
 #include "pycore_opcode.h"        // EXTRA_CASES
 #include "pycore_opcode_metadata.h"  // uop names
 #include "pycore_opcode_utils.h"  // MAKE_FUNCTION_*
 #include "pycore_pyerrors.h"      // _PyErr_GetRaisedException()
 #include "pycore_pystate.h"       // _PyInterpreterState_GET()
 #include "pycore_range.h"         // _PyRangeIterObject
+#include "pycore_setobject.h"     // _PySet_NextEntry()
 #include "pycore_sliceobject.h"   // _PyBuildSlice_ConsumeRefs
 #include "pycore_sysmodule.h"     // _PySys_Audit()
 #include "pycore_tuple.h"         // _PyTuple_ITEMS()
 #include "pycore_typeobject.h"    // _PySuper_Lookup()
-#include "pycore_emscripten_signal.h"  // _Py_CHECK_EMSCRIPTEN_SIGNALS
 
 #include "pycore_dict.h"
 #include "dictobject.h"
@@ -35,7 +36,7 @@
 #include "optimizer.h"
 #include "pydtrace.h"
 #include "setobject.h"
-#include "structmember.h"         // struct PyMemberDef, T_OFFSET_EX
+
 
 #define USE_COMPUTED_GOTOS 0
 #include "ceval_macros.h"
@@ -77,7 +78,6 @@ dummy_func(
     PyObject **stack_pointer,
     PyObject *kwnames,
     int throwflag,
-    binaryfunc binary_ops[],
     PyObject *args[]
 )
 {
@@ -698,14 +698,14 @@ dummy_func(
 
         inst(CALL_INTRINSIC_1, (value -- res)) {
             assert(oparg <= MAX_INTRINSIC_1);
-            res = _PyIntrinsics_UnaryFunctions[oparg](tstate, value);
+            res = _PyIntrinsics_UnaryFunctions[oparg].func(tstate, value);
             DECREF_INPUTS();
             ERROR_IF(res == NULL, error);
         }
 
         inst(CALL_INTRINSIC_2, (value2, value1 -- res)) {
             assert(oparg <= MAX_INTRINSIC_2);
-            res = _PyIntrinsics_BinaryFunctions[oparg](tstate, value2, value1);
+            res = _PyIntrinsics_BinaryFunctions[oparg].func(tstate, value2, value1);
             DECREF_INPUTS();
             ERROR_IF(res == NULL, error);
         }
@@ -720,7 +720,11 @@ dummy_func(
                 exc = args[0];
                 /* fall through */
             case 0:
-                ERROR_IF(do_raise(tstate, exc, cause), exception_unwind);
+                if (do_raise(tstate, exc, cause)) {
+                    assert(oparg == 0);
+                    monitor_reraise(tstate, frame, next_instr-1);
+                    goto exception_unwind;
+                }
                 break;
             default:
                 _PyErr_SetString(tstate, PyExc_SystemError,
@@ -737,7 +741,7 @@ dummy_func(
             tstate->cframe = cframe.previous;
             assert(tstate->cframe->current_frame == frame->previous);
             assert(!_PyErr_Occurred(tstate));
-            _Py_LeaveRecursiveCallTstate(tstate);
+            tstate->c_recursion_remaining += PY_EVAL_C_STACK_UNITS;
             return retval;
         }
 
@@ -893,7 +897,7 @@ dummy_func(
             iter = _PyCoro_GetAwaitableIter(iterable);
 
             if (iter == NULL) {
-                format_awaitable_error(tstate, Py_TYPE(iterable), oparg);
+                _PyEval_FormatAwaitableError(tstate, Py_TYPE(iterable), oparg);
             }
 
             DECREF_INPUTS();
@@ -1047,6 +1051,7 @@ dummy_func(
             assert(exc && PyExceptionInstance_Check(exc));
             Py_INCREF(exc);
             _PyErr_SetRaisedException(tstate, exc);
+            monitor_reraise(tstate, frame, next_instr-1);
             goto exception_unwind;
         }
 
@@ -1058,6 +1063,7 @@ dummy_func(
             else {
                 Py_INCREF(exc);
                 _PyErr_SetRaisedException(tstate, exc);
+                monitor_reraise(tstate, frame, next_instr-1);
                 goto exception_unwind;
             }
         }
@@ -1072,6 +1078,7 @@ dummy_func(
             }
             else {
                 _PyErr_SetRaisedException(tstate, Py_NewRef(exc_value));
+                monitor_reraise(tstate, frame, next_instr-1);
                 goto exception_unwind;
             }
         }
@@ -1120,9 +1127,9 @@ dummy_func(
             err = PyObject_DelItem(ns, name);
             // Can't use ERROR_IF here.
             if (err != 0) {
-                format_exc_check_arg(tstate, PyExc_NameError,
-                                     NAME_ERROR_MSG,
-                                     name);
+                _PyEval_FormatExcCheckArg(tstate, PyExc_NameError,
+                                          NAME_ERROR_MSG,
+                                          name);
                 goto error;
             }
         }
@@ -1145,7 +1152,7 @@ dummy_func(
             DECREMENT_ADAPTIVE_COUNTER(cache->counter);
             #endif  /* ENABLE_SPECIALIZATION */
             PyObject **top = stack_pointer + oparg - 1;
-            int res = unpack_iterable(tstate, seq, oparg, -1, top);
+            int res = _PyEval_UnpackIterable(tstate, seq, oparg, -1, top);
             DECREF_INPUTS();
             ERROR_IF(res == 0, error);
         }
@@ -1185,7 +1192,7 @@ dummy_func(
         inst(UNPACK_EX, (seq -- unused[oparg & 0xFF], unused, unused[oparg >> 8])) {
             int totalargs = 1 + (oparg & 0xFF) + (oparg >> 8);
             PyObject **top = stack_pointer + totalargs - 1;
-            int res = unpack_iterable(tstate, seq, oparg & 0xFF, oparg >> 8, top);
+            int res = _PyEval_UnpackIterable(tstate, seq, oparg & 0xFF, oparg >> 8, top);
             DECREF_INPUTS();
             ERROR_IF(res == 0, error);
         }
@@ -1235,8 +1242,8 @@ dummy_func(
             // Can't use ERROR_IF here.
             if (err != 0) {
                 if (_PyErr_ExceptionMatches(tstate, PyExc_KeyError)) {
-                    format_exc_check_arg(tstate, PyExc_NameError,
-                                         NAME_ERROR_MSG, name);
+                    _PyEval_FormatExcCheckArg(tstate, PyExc_NameError,
+                                              NAME_ERROR_MSG, name);
                 }
                 goto error;
             }
@@ -1274,7 +1281,7 @@ dummy_func(
                         goto error;
                     }
                     if (v == NULL) {
-                        format_exc_check_arg(
+                        _PyEval_FormatExcCheckArg(
                                     tstate, PyExc_NameError,
                                     NAME_ERROR_MSG, name);
                         goto error;
@@ -1315,8 +1322,8 @@ dummy_func(
                     if (!_PyErr_Occurred(tstate)) {
                         /* _PyDict_LoadGlobal() returns NULL without raising
                          * an exception if the key doesn't exist */
-                        format_exc_check_arg(tstate, PyExc_NameError,
-                                             NAME_ERROR_MSG, name);
+                        _PyEval_FormatExcCheckArg(tstate, PyExc_NameError,
+                                                  NAME_ERROR_MSG, name);
                     }
                     ERROR_IF(true, error);
                 }
@@ -1331,7 +1338,7 @@ dummy_func(
                     /* namespace 2: builtins */
                     ERROR_IF(PyMapping_GetOptionalItem(BUILTINS(), name, &v) < 0, error);
                     if (v == NULL) {
-                        format_exc_check_arg(
+                        _PyEval_FormatExcCheckArg(
                                     tstate, PyExc_NameError,
                                     NAME_ERROR_MSG, name);
                         ERROR_IF(true, error);
@@ -1339,9 +1346,6 @@ dummy_func(
                 }
             }
             null = NULL;
-        }
-
-        op(_SKIP_CACHE, (unused/1 -- )) {
         }
 
         op(_GUARD_GLOBALS_VERSION, (version/1 --)) {
@@ -1379,13 +1383,13 @@ dummy_func(
         }
 
         macro(LOAD_GLOBAL_MODULE) =
-            _SKIP_CACHE + // Skip over the counter
+            unused/1 + // Skip over the counter
             _GUARD_GLOBALS_VERSION +
-            _SKIP_CACHE + // Skip over the builtins version
+            unused/1 + // Skip over the builtins version
             _LOAD_GLOBAL_MODULE;
 
         macro(LOAD_GLOBAL_BUILTIN) =
-            _SKIP_CACHE + // Skip over the counter
+            unused/1 + // Skip over the counter
             _GUARD_GLOBALS_VERSION +
             _GUARD_BUILTINS_VERSION +
             _LOAD_GLOBAL_BUILTINS;
@@ -1413,7 +1417,7 @@ dummy_func(
             // Can't use ERROR_IF here.
             // Fortunately we don't need its superpower.
             if (oldobj == NULL) {
-                format_exc_unbound(tstate, _PyFrame_GetCode(frame), oparg);
+                _PyEval_FormatExcUnbound(tstate, _PyFrame_GetCode(frame), oparg);
                 goto error;
             }
             PyCell_SET(cell, NULL);
@@ -1434,7 +1438,7 @@ dummy_func(
                 PyObject *cell = GETLOCAL(oparg);
                 value = PyCell_GET(cell);
                 if (value == NULL) {
-                    format_exc_unbound(tstate, _PyFrame_GetCode(frame), oparg);
+                    _PyEval_FormatExcUnbound(tstate, _PyFrame_GetCode(frame), oparg);
                     goto error;
                 }
                 Py_INCREF(value);
@@ -1445,7 +1449,7 @@ dummy_func(
             PyObject *cell = GETLOCAL(oparg);
             value = PyCell_GET(cell);
             if (value == NULL) {
-                format_exc_unbound(tstate, _PyFrame_GetCode(frame), oparg);
+                _PyEval_FormatExcUnbound(tstate, _PyFrame_GetCode(frame), oparg);
                 ERROR_IF(true, error);
             }
             Py_INCREF(value);
@@ -1612,7 +1616,7 @@ dummy_func(
             PyObject *dict = PEEK(oparg + 1);  // update is still on the stack
 
             if (_PyDict_MergeEx(dict, update, 2) < 0) {
-                format_kwargs_error(tstate, PEEK(3 + oparg), update);
+                _PyEval_FormatKwargsError(tstate, PEEK(3 + oparg), update);
                 DECREF_INPUTS();
                 ERROR_IF(true, error);
             }
@@ -1721,7 +1725,7 @@ dummy_func(
             PyTypeObject *cls = (PyTypeObject *)class;
             int method_found = 0;
             res2 = _PySuper_Lookup(cls, self, name,
-                                   cls->tp_getattro == PyObject_GenericGetAttr ? &method_found : NULL);
+                                   Py_TYPE(self)->tp_getattro == PyObject_GenericGetAttr ? &method_found : NULL);
             Py_DECREF(global_super);
             Py_DECREF(class);
             if (res2 == NULL) {
@@ -1817,7 +1821,7 @@ dummy_func(
             DEOPT_IF(!_PyDictOrValues_IsValues(dorv), LOAD_ATTR);
         }
 
-        op(_LOAD_ATTR_INSTANCE_VALUE, (index/1, unused/5, owner -- res2 if (oparg & 1), res)) {
+        op(_LOAD_ATTR_INSTANCE_VALUE, (index/1, owner -- res2 if (oparg & 1), res)) {
             PyDictOrValues dorv = *_PyObject_DictOrValuesPointer(owner);
             res = _PyDictOrValues_GetValues(dorv)->values[index];
             DEOPT_IF(res == NULL, LOAD_ATTR);
@@ -1828,10 +1832,11 @@ dummy_func(
         }
 
         macro(LOAD_ATTR_INSTANCE_VALUE) =
-            _SKIP_CACHE + // Skip over the counter
+            unused/1 + // Skip over the counter
             _GUARD_TYPE_VERSION +
             _CHECK_MANAGED_OBJECT_HAS_VALUES +
-            _LOAD_ATTR_INSTANCE_VALUE;
+            _LOAD_ATTR_INSTANCE_VALUE +
+            unused/5;  // Skip over rest of cache
 
         inst(LOAD_ATTR_MODULE, (unused/1, type_version/2, index/1, unused/5, owner -- res2 if (oparg & 1), res)) {
             DEOPT_IF(!PyModule_CheckExact(owner), LOAD_ATTR);
@@ -2126,15 +2131,15 @@ dummy_func(
         }
 
         inst(CHECK_EG_MATCH, (exc_value, match_type -- rest, match)) {
-            if (check_except_star_type_valid(tstate, match_type) < 0) {
+            if (_PyEval_CheckExceptStarTypeValid(tstate, match_type) < 0) {
                 DECREF_INPUTS();
                 ERROR_IF(true, error);
             }
 
             match = NULL;
             rest = NULL;
-            int res = exception_group_match(exc_value, match_type,
-                                            &match, &rest);
+            int res = _PyEval_ExceptionGroupMatch(exc_value, match_type,
+                                                  &match, &rest);
             DECREF_INPUTS();
             ERROR_IF(res < 0, error);
 
@@ -2148,7 +2153,7 @@ dummy_func(
 
         inst(CHECK_EXC_MATCH, (left, right -- left, b)) {
             assert(PyExceptionInstance_Check(left));
-            if (check_except_type_valid(tstate, right) < 0) {
+            if (_PyEval_CheckExceptTypeValid(tstate, right) < 0) {
                  DECREF_INPUTS();
                  ERROR_IF(true, error);
             }
@@ -2182,7 +2187,14 @@ dummy_func(
             JUMPBY(1-oparg);
             #if ENABLE_SPECIALIZATION
             here[1].cache += (1 << OPTIMIZER_BITS_IN_COUNTER);
-            if (here[1].cache > tstate->interp->optimizer_backedge_threshold) {
+            if (here[1].cache > tstate->interp->optimizer_backedge_threshold &&
+                // Double-check that the opcode isn't instrumented or something:
+                here->op.code == JUMP_BACKWARD &&
+                // _PyOptimizer_BackEdge is going to change frame->prev_instr,
+                // which breaks line event calculations:
+                next_instr->op.code != INSTRUMENTED_LINE
+                )
+            {
                 OBJECT_STAT_INC(optimization_attempts);
                 frame = _PyOptimizer_BackEdge(frame, here, next_instr, stack_pointer);
                 if (frame == NULL) {
@@ -2268,7 +2280,7 @@ dummy_func(
             // Pop TOS and TOS1. Set TOS to a tuple of attributes on success, or
             // None on failure.
             assert(PyTuple_CheckExact(names));
-            attrs = match_class(tstate, subject, type, oparg, names);
+            attrs = _PyEval_MatchClass(tstate, subject, type, oparg, names);
             DECREF_INPUTS();
             if (attrs) {
                 assert(PyTuple_CheckExact(attrs));  // Success!
@@ -2291,7 +2303,7 @@ dummy_func(
 
         inst(MATCH_KEYS, (subject, keys -- subject, keys, values_or_none)) {
             // On successful match, PUSH(values). Otherwise, PUSH(None).
-            values_or_none = match_keys(tstate, subject, keys);
+            values_or_none = _PyEval_MatchKeys(tstate, subject, keys);
             ERROR_IF(values_or_none == NULL, error);
         }
 
@@ -2658,7 +2670,12 @@ dummy_func(
             assert(val && PyExceptionInstance_Check(val));
             exc = PyExceptionInstance_Class(val);
             tb = PyException_GetTraceback(val);
-            Py_XDECREF(tb);
+            if (tb == NULL) {
+                tb = Py_None;
+            }
+            else {
+                Py_DECREF(tb);
+            }
             assert(PyLong_Check(lasti));
             (void)lasti; // Shut up compiler warning if asserts are off
             PyObject *stack[4] = {NULL, exc, val, tb};
@@ -3228,7 +3245,7 @@ dummy_func(
                 total_args++;
             }
             DEOPT_IF(total_args != 1, CALL);
-            PyInterpreterState *interp = _PyInterpreterState_GET();
+            PyInterpreterState *interp = tstate->interp;
             DEOPT_IF(callable != interp->callable_cache.len, CALL);
             STAT_INC(CALL, hit);
             PyObject *arg = args[0];
@@ -3255,7 +3272,7 @@ dummy_func(
                 total_args++;
             }
             DEOPT_IF(total_args != 2, CALL);
-            PyInterpreterState *interp = _PyInterpreterState_GET();
+            PyInterpreterState *interp = tstate->interp;
             DEOPT_IF(callable != interp->callable_cache.isinstance, CALL);
             STAT_INC(CALL, hit);
             PyObject *cls = args[1];
@@ -3278,7 +3295,7 @@ dummy_func(
             ASSERT_KWNAMES_IS_NULL();
             assert(oparg == 1);
             assert(method != NULL);
-            PyInterpreterState *interp = _PyInterpreterState_GET();
+            PyInterpreterState *interp = tstate->interp;
             DEOPT_IF(method != interp->callable_cache.list_append, CALL);
             DEOPT_IF(!PyList_Check(self), CALL);
             STAT_INC(CALL, hit);
@@ -3610,10 +3627,10 @@ dummy_func(
             STAT_INC(BINARY_OP, deferred);
             DECREMENT_ADAPTIVE_COUNTER(cache->counter);
             #endif  /* ENABLE_SPECIALIZATION */
-            assert(0 <= oparg);
-            assert((unsigned)oparg < Py_ARRAY_LENGTH(binary_ops));
-            assert(binary_ops[oparg]);
-            res = binary_ops[oparg](lhs, rhs);
+            assert(NB_ADD <= oparg);
+            assert(oparg <= NB_INPLACE_XOR);
+            assert(_PyEval_BinaryOps[oparg]);
+            res = _PyEval_BinaryOps[oparg](lhs, rhs);
             DECREF_INPUTS();
             ERROR_IF(res == NULL, error);
         }
