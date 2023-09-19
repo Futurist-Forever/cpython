@@ -1,7 +1,13 @@
 /* interpreters module */
 /* low-level access to interpreter primitives */
 
+#ifndef Py_BUILD_CORE_BUILTIN
+#  define Py_BUILD_CORE_MODULE 1
+#endif
+
 #include "Python.h"
+#include "pycore_initconfig.h"    // _PyErr_SetFromPyStatus()
+#include "pycore_pyerrors.h"      // _PyErr_ChainExceptions1()
 #include "interpreteridobject.h"
 
 
@@ -35,7 +41,7 @@ _get_current_interp(void)
 static PyObject *
 add_new_exception(PyObject *mod, const char *name, PyObject *base)
 {
-    assert(!PyObject_HasAttrString(mod, name));
+    assert(!PyObject_HasAttrStringWithError(mod, name));
     PyObject *exctype = PyErr_NewException(name, base, NULL);
     if (exctype == NULL) {
         return NULL;
@@ -369,7 +375,7 @@ _is_running(PyInterpreterState *interp)
     }
 
     assert(!PyErr_Occurred());
-    struct _PyInterpreterFrame *frame = tstate->cframe->current_frame;
+    struct _PyInterpreterFrame *frame = tstate->current_frame;
     if (frame == NULL) {
         return 0;
     }
