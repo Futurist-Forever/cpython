@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import lexer
 import parser
 import re
@@ -111,7 +111,7 @@ class StackItem:
         return f"{type}{self.name}{size}{cond} {self.peek}"
 
     def is_array(self) -> bool:
-        return self.type == "PyObject **"
+        return self.type == "_PyStackRef *"
 
 
 @dataclass
@@ -235,6 +235,7 @@ class Instruction:
 @dataclass
 class PseudoInstruction:
     name: str
+    stack: StackEffect
     targets: list[Instruction]
     flags: list[str]
     opcode: int = -1
@@ -295,7 +296,7 @@ def convert_stack_item(item: parser.StackEffect, replace_op_arg_1: str | None) -
         item.name, item.type, cond, (item.size or "1")
     )
 
-def analyze_stack(op: parser.InstDef, replace_op_arg_1: str | None = None) -> StackEffect:
+def analyze_stack(op: parser.InstDef | parser.Pseudo, replace_op_arg_1: str | None = None) -> StackEffect:
     inputs: list[StackItem] = [
         convert_stack_item(i, replace_op_arg_1) for i in op.inputs if isinstance(i, parser.StackEffect)
     ]
@@ -352,12 +353,29 @@ def has_error_without_pop(op: parser.InstDef) -> bool:
 
 
 NON_ESCAPING_FUNCTIONS = (
+    "PyStackRef_FromPyObjectSteal",
+    "PyStackRef_AsPyObjectBorrow",
+    "PyStackRef_AsPyObjectSteal",
+    "PyStackRef_CLOSE",
+    "PyStackRef_DUP",
+    "PyStackRef_CLEAR",
+    "PyStackRef_IsNull",
+    "PyStackRef_TYPE",
+    "PyStackRef_False",
+    "PyStackRef_True",
+    "PyStackRef_None",
+    "PyStackRef_Is",
+    "PyStackRef_FromPyObjectNew",
+    "PyStackRef_AsPyObjectNew",
+    "PyStackRef_FromPyObjectImmortal",
     "Py_INCREF",
     "_PyManagedDictPointer_IsValues",
+    "_PyObject_GetManagedDict",
     "_PyObject_ManagedDictPointer",
     "_PyObject_InlineValues",
     "_PyDictValues_AddToInsertionOrder",
     "Py_DECREF",
+    "Py_XDECREF",
     "_Py_DECREF_SPECIALIZED",
     "DECREF_INPUTS_AND_REUSE_FLOAT",
     "PyUnicode_Append",
@@ -365,6 +383,7 @@ NON_ESCAPING_FUNCTIONS = (
     "Py_SIZE",
     "Py_TYPE",
     "PyList_GET_ITEM",
+    "PyList_SET_ITEM",
     "PyTuple_GET_ITEM",
     "PyList_GET_SIZE",
     "PyTuple_GET_SIZE",
@@ -395,13 +414,23 @@ NON_ESCAPING_FUNCTIONS = (
     "_PyFrame_SetStackPointer",
     "_PyType_HasFeature",
     "PyUnicode_Concat",
-    "_PyList_FromArraySteal",
-    "_PyTuple_FromArraySteal",
     "PySlice_New",
     "_Py_LeaveRecursiveCallPy",
     "CALL_STAT_INC",
+    "STAT_INC",
     "maybe_lltrace_resume_frame",
     "_PyUnicode_JoinArray",
+    "_PyEval_FrameClearAndPop",
+    "_PyFrame_StackPush",
+    "PyCell_New",
+    "PyFloat_AS_DOUBLE",
+    "_PyFrame_PushUnchecked",
+    "Py_FatalError",
+    "STACKREFS_TO_PYOBJECTS",
+    "STACKREFS_TO_PYOBJECTS_CLEANUP",
+    "CONVERSION_FAILED",
+    "_PyList_FromArraySteal",
+    "_PyTuple_FromArraySteal",
 )
 
 ESCAPING_FUNCTIONS = (
@@ -426,6 +455,8 @@ def makes_escaping_api_call(instr: parser.InstDef) -> bool:
         if next_tkn.kind != lexer.LPAREN:
             continue
         if tkn.text in ESCAPING_FUNCTIONS:
+            return True
+        if tkn.text == "tp_vectorcall":
             return True
         if not tkn.text.startswith("Py") and not tkn.text.startswith("_Py"):
             continue
@@ -694,6 +725,7 @@ def add_pseudo(
 ) -> None:
     pseudos[pseudo.name] = PseudoInstruction(
         pseudo.name,
+        analyze_stack(pseudo),
         [instructions[target] for target in pseudo.targets],
         pseudo.flags,
     )
