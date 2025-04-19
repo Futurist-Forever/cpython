@@ -582,6 +582,7 @@ struct _warnings_runtime_state {
     PyObject *default_action; /* String */
     _PyRecursiveMutex lock;
     long filters_version;
+    PyObject *context;
 };
 
 struct _Py_mem_interp_free_queue {
@@ -752,6 +753,12 @@ struct _is {
      * which is by far the hottest field in this struct
      * and should be placed at the beginning. */
     struct _ceval_state ceval;
+
+   /* This structure is carefully allocated so that it's correctly aligned
+     * to avoid undefined behaviors during LOAD and STORE. The '_malloced'
+     * field stores the allocated pointer address that will later be freed.
+     */
+    void *_malloced;
 
     PyInterpreterState *next;
 
